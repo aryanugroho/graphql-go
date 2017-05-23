@@ -3,6 +3,7 @@ package graphql
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"encoding/json"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/neelance/graphql-go/errors"
 	"github.com/neelance/graphql-go/internal/common"
 	"github.com/neelance/graphql-go/internal/exec"
+	"github.com/neelance/graphql-go/internal/exec/packer"
 	"github.com/neelance/graphql-go/internal/exec/resolvable"
 	"github.com/neelance/graphql-go/internal/exec/selected"
 	"github.com/neelance/graphql-go/internal/query"
@@ -42,12 +44,181 @@ func (id ID) MarshalJSON() ([]byte, error) {
 	return strconv.AppendQuote(nil, string(id)), nil
 }
 
+func ParseSchema(schemaString string) *SchemaBuilder {
+	b, err := TryParseSchema(schemaString)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func TryParseSchema(schemaString string) (*SchemaBuilder, error) {
+	b := &SchemaBuilder{
+		schema:        schema.New(),
+		resolvers:     make(resolvable.TypeToResolversMap),
+		packerBuilder: packer.NewBuilder(),
+	}
+	if err := b.schema.Parse(schemaString); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+type SchemaBuilder struct {
+	schema        *schema.Schema
+	resolvers     resolvable.TypeToResolversMap
+	packerBuilder *packer.Builder
+}
+
+type untypedResolver func(valueType reflect.Type, args common.InputValueList) (*resolvable.Resolver, error)
+
+func (b *SchemaBuilder) Resolvers(graphqlType string, goType interface{}, fieldMap map[string]interface{}) {
+	st, ok := b.schema.Types[graphqlType]
+	if !ok {
+		panic("type not found") // TODO
+	}
+
+	t := common.TypePair{GraphQLType: st, GoType: reflect.TypeOf(goType)}
+	m := make(resolvable.FieldToResolverMap)
+	for field, resolver := range fieldMap {
+
+		f := fields(t.GraphQLType).Get(field)
+		if f == nil {
+			panic("field not found") // TODO
+		}
+
+		var utRes untypedResolver
+		switch r := resolver.(type) {
+		case string:
+			utRes = b.newResolverField(r)
+		default:
+			utRes = b.newResolverFunc(reflect.ValueOf(r))
+		}
+
+		res, err := utRes(t.GoType, f.Args)
+		if err != nil {
+			panic(err) // TODO
+		}
+
+		m[field] = res
+	}
+	b.resolvers[t] = m
+}
+
+func (b *SchemaBuilder) newResolverField(goField string) untypedResolver {
+	return func(valueType reflect.Type, args common.InputValueList) (*resolvable.Resolver, error) {
+		if valueType.Kind() == reflect.Ptr {
+			valueType = valueType.Elem()
+		}
+		sf, ok := valueType.FieldByName(goField)
+		if !ok {
+			return nil, fmt.Errorf("type %s has no field %q", valueType, goField)
+		}
+
+		return &resolvable.Resolver{
+			Select: func(args map[string]interface{}) (resolvable.SelectedResolver, bool, error) {
+				return func(ctx context.Context, parent reflect.Value) (reflect.Value, error) {
+					if parent.Kind() == reflect.Ptr {
+						parent = parent.Elem()
+					}
+					return parent.FieldByIndex(sf.Index), nil
+				}, false, nil
+			},
+			ResultType: sf.Type,
+		}, nil
+	}
+}
+
+var contextType = reflect.TypeOf((*context.Context)(nil)).Elem()
+var errorType = reflect.TypeOf((*error)(nil)).Elem()
+
+func (b *SchemaBuilder) newResolverFunc(fn reflect.Value) untypedResolver {
+	return func(valueType reflect.Type, args common.InputValueList) (*resolvable.Resolver, error) {
+		in := make([]reflect.Type, fn.Type().NumIn())
+		for i := range in {
+			in[i] = fn.Type().In(i)
+		}
+		in = in[1:] // first parameter is value
+
+		hasContext := len(in) > 0 && in[0] == contextType
+		if hasContext {
+			in = in[1:]
+		}
+
+		var argsPacker *packer.StructPacker
+		if len(args) > 0 {
+			if len(in) == 0 {
+				return nil, fmt.Errorf("must have parameter for field arguments")
+			}
+			var err error
+			argsPacker, err = b.packerBuilder.MakeStructPacker(args, in[0])
+			if err != nil {
+				return nil, err
+			}
+			in = in[1:]
+		}
+
+		if len(in) > 0 {
+			return nil, fmt.Errorf("too many parameters")
+		}
+
+		if fn.Type().NumOut() > 2 {
+			return nil, fmt.Errorf("too many return values")
+		}
+
+		hasError := fn.Type().NumOut() == 2
+		if hasError {
+			if fn.Type().Out(1) != errorType {
+				return nil, fmt.Errorf(`must have "error" as its second return value`)
+			}
+		}
+
+		return &resolvable.Resolver{
+			Select: func(args map[string]interface{}) (resolvable.SelectedResolver, bool, error) {
+				var packedArgs reflect.Value
+				if argsPacker != nil {
+					var err error
+					packedArgs, err = argsPacker.Pack(args)
+					if err != nil {
+						return nil, false, err
+					}
+				}
+
+				async := hasContext || argsPacker != nil || hasError
+				return func(ctx context.Context, parent reflect.Value) (reflect.Value, error) {
+					in := []reflect.Value{parent}
+					if hasContext {
+						in = append(in, reflect.ValueOf(ctx))
+					}
+					if argsPacker != nil {
+						in = append(in, packedArgs)
+					}
+					callOut := fn.Call(in)
+					if hasError && !callOut[1].IsNil() {
+						return reflect.Value{}, callOut[1].Interface().(error)
+					}
+					return callOut[0], nil
+				}, async, nil
+			},
+			ResultType: fn.Type().Out(0),
+		}, nil
+	}
+}
+
 // ParseSchema parses a GraphQL schema and attaches the given root resolver. It returns an error if
 // the Go type signature of the resolvers does not match the schema. If nil is passed as the
 // resolver, then the schema can not be executed, but it may be inspected (e.g. with ToJSON).
-func ParseSchema(schemaString string, resolver interface{}, opts ...SchemaOpt) (*Schema, error) {
+func (b *SchemaBuilder) Build(root interface{}, opts ...SchemaOpt) *Schema {
+	s, err := b.TryBuild(root, opts...)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+func (b *SchemaBuilder) TryBuild(root interface{}, opts ...SchemaOpt) (*Schema, error) {
 	s := &Schema{
-		schema:         schema.New(),
+		schema:         b.schema,
 		maxParallelism: 10,
 		tracer:         trace.OpenTracingTracer{},
 		logger:         &log.DefaultLogger{},
@@ -56,28 +227,17 @@ func ParseSchema(schemaString string, resolver interface{}, opts ...SchemaOpt) (
 		opt(s)
 	}
 
-	if err := s.schema.Parse(schemaString); err != nil {
-		return nil, err
-	}
-
-	if resolver != nil {
-		r, err := resolvable.ApplyResolver(s.schema, resolver)
+	if root != nil {
+		r, err := resolvable.ApplyResolvers(s.schema, b.resolvers, root)
 		if err != nil {
 			return nil, err
 		}
 		s.res = r
 	}
 
-	return s, nil
-}
+	b.packerBuilder.Finish()
 
-// MustParseSchema calls ParseSchema and panics on error.
-func MustParseSchema(schemaString string, resolver interface{}, opts ...SchemaOpt) *Schema {
-	s, err := ParseSchema(schemaString, resolver, opts...)
-	if err != nil {
-		panic(err)
-	}
-	return s
+	return s, nil
 }
 
 // Schema represents a GraphQL schema with an optional resolver.
@@ -195,4 +355,15 @@ func getOperation(document *query.Document, operationName string) (*query.Operat
 		return nil, fmt.Errorf("no operation with name %q", operationName)
 	}
 	return op, nil
+}
+
+func fields(t common.Type) schema.FieldList {
+	switch t := t.(type) {
+	case *schema.Object:
+		return t.Fields
+	case *schema.Interface:
+		return t.Fields
+	default:
+		return nil
+	}
 }

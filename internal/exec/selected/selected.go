@@ -47,7 +47,7 @@ type SchemaField struct {
 	resolvable.Field
 	Alias       string
 	Args        map[string]interface{}
-	PackedArgs  reflect.Value
+	Resolver    resolvable.SelectedResolver
 	Sels        []Selection
 	Async       bool
 	FixedResult reflect.Value
@@ -117,28 +117,27 @@ func applySelectionSet(r *Request, e *resolvable.Object, sels []query.Selection)
 				fe := e.Fields[field.Name.Name]
 
 				var args map[string]interface{}
-				var packedArgs reflect.Value
-				if fe.ArgsPacker != nil {
+				if len(field.Arguments) > 0 {
 					args = make(map[string]interface{})
 					for _, arg := range field.Arguments {
 						args[arg.Name.Name] = arg.Value.Value(r.Vars)
 					}
-					var err error
-					packedArgs, err = fe.ArgsPacker.Pack(args)
-					if err != nil {
-						r.AddError(errors.Errorf("%s", err))
-						return
-					}
+				}
+
+				res, async, err := fe.Resolver.Select(args)
+				if err != nil {
+					r.AddError(errors.Errorf("%s", err))
+					return
 				}
 
 				fieldSels := applyField(r, fe.ValueExec, field.Selections)
 				flattenedSels = append(flattenedSels, &SchemaField{
-					Field:      *fe,
-					Alias:      field.Alias.Name,
-					Args:       args,
-					PackedArgs: packedArgs,
-					Sels:       fieldSels,
-					Async:      fe.HasContext || fe.ArgsPacker != nil || fe.HasError || HasAsyncSel(fieldSels),
+					Field:    *fe,
+					Alias:    field.Alias.Name,
+					Args:     args,
+					Resolver: res,
+					Sels:     fieldSels,
+					Async:    async || HasAsyncSel(fieldSels),
 				})
 			}
 

@@ -56,10 +56,10 @@ func (r *Request) Execute(ctx context.Context, s *resolvable.Schema, op *query.O
 }
 
 type fieldToExec struct {
-	field    *selected.SchemaField
-	sels     []selected.Selection
-	resolver reflect.Value
-	out      *bytes.Buffer
+	field  *selected.SchemaField
+	sels   []selected.Selection
+	parent reflect.Value
+	out    *bytes.Buffer
 }
 
 func (r *Request) execSelections(ctx context.Context, sels []selected.Selection, path *pathSegment, resolver reflect.Value, out *bytes.Buffer, serially bool) {
@@ -107,7 +107,7 @@ func collectFieldsToResolve(sels []selected.Selection, resolver reflect.Value, f
 		case *selected.SchemaField:
 			field, ok := fieldByAlias[sel.Alias]
 			if !ok { // validation already checked for conflict (TODO)
-				field = &fieldToExec{field: sel, resolver: resolver}
+				field = &fieldToExec{field: sel, parent: resolver}
 				fieldByAlias[sel.Alias] = field
 				*fields = append(*fields, field)
 			}
@@ -119,7 +119,7 @@ func collectFieldsToResolve(sels []selected.Selection, resolver reflect.Value, f
 				Alias:       sel.Alias,
 				FixedResult: reflect.ValueOf(typeOf(sel, resolver)),
 			}
-			*fields = append(*fields, &fieldToExec{field: sf, resolver: resolver})
+			*fields = append(*fields, &fieldToExec{field: sf, parent: resolver})
 
 		case *selected.TypeAssertion:
 			out := resolver.Method(sel.MethodIndex).Call(nil)
@@ -154,13 +154,12 @@ func execFieldSelection(ctx context.Context, r *Request, f *fieldToExec, path *p
 
 	var result reflect.Value
 	var err *errors.QueryError
-
 	traceCtx, finish := r.Tracer.TraceField(ctx, f.field.TraceLabel, f.field.TypeName, f.field.Name, !f.field.Async, f.field.Args)
 	defer func() {
 		finish(err)
 	}()
 
-	err = func() (err *errors.QueryError) {
+	result, err = func() (result reflect.Value, err *errors.QueryError) {
 		defer func() {
 			if panicValue := recover(); panicValue != nil {
 				r.Logger.LogPanic(ctx, panicValue)
@@ -169,32 +168,22 @@ func execFieldSelection(ctx context.Context, r *Request, f *fieldToExec, path *p
 			}
 		}()
 
-		if f.field.FixedResult.IsValid() {
-			result = f.field.FixedResult
-			return nil
-		}
-
 		if err := traceCtx.Err(); err != nil {
-			return errors.Errorf("%s", err) // don't execute any more resolvers if context got cancelled
+			return reflect.Value{}, errors.Errorf("%s", err) // don't execute any more resolvers if context got cancelled
 		}
 
-		var in []reflect.Value
-		if f.field.HasContext {
-			in = append(in, reflect.ValueOf(traceCtx))
+		if f.field.FixedResult.IsValid() {
+			return f.field.FixedResult, nil
 		}
-		if f.field.ArgsPacker != nil {
-			in = append(in, f.field.PackedArgs)
-		}
-		callOut := f.resolver.Method(f.field.MethodIndex).Call(in)
-		result = callOut[0]
-		if f.field.HasError && !callOut[1].IsNil() {
-			resolverErr := callOut[1].Interface().(error)
+
+		result, resolverErr := f.field.Resolver(traceCtx, f.parent)
+		if resolverErr != nil {
 			err := errors.Errorf("%s", resolverErr)
 			err.Path = path.toSlice()
 			err.ResolverError = resolverErr
-			return err
+			return reflect.Value{}, err
 		}
-		return nil
+		return result, nil
 	}()
 
 	if applyLimiter {
